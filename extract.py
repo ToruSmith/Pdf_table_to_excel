@@ -5,11 +5,13 @@ PDF 報表擷取核心邏輯（與 UI 框架無關，Streamlit / Gradio 皆可�
 1) 依 Y 座標分行
 2) 找表頭：
    - 優先嘗試「序號模式」：第一個「第一格是純數字序號」列的前一行
-   - 找不到就退而求其次用「通用模式」：表頭/資料列的共同特徵是「橫向鋪滿整個
-     表格寬度」，這點跟標題、報表資訊這種短句或靠左的 key-value 前言不同——
-     它們字數可能不少，但橫向只佔頁寬一小段。取第一個「欄位數夠多、且橫向
-     跨幅達頁寬一半以上」的行當表頭
-   - 兩種都找不到時，呼叫端可手動指定 header_idx（在偵錯畫面看行號）
+   - 找不到就用「通用模式方案二」：先找資料本體（連續好幾行、欄位數都
+     固定一樣的區塊，這比表頭本身的形狀更可靠），再從資料本體往回找
+     表頭區塊（可能跨好幾行、有分組標籤，會自動合併成複合欄名）
+   - 方案二也找不到（例如資料列因文字長短不一導致欄位數不固定），
+     退而求其次用「方案一」：找第一個「欄位數夠多、且橫向跨幅達頁寬
+     一半以上」的單一行當表頭
+   - 三種都找不到時，呼叫端可手動指定 header_idx（在偵錯畫面看行號）
 3) 欄界不用表頭文字位置，改用資料列文字座標的「最大間距」決定
    （避免寬欄位表頭置中/偏移造成誤判，例如 行庫名稱、載具號碼 這種寬欄位）
 4) 判斷「新的一列」還是「上一列換行延續」：
@@ -67,11 +69,12 @@ def _line_span(line):
 
 def find_header_index_generic(lines, page_width, min_cols=3, min_span_ratio=0.5):
     """
-    通用模式（不假設第一欄是序號）：
+    通用模式，方案一（不假設第一欄是序號）：
     表頭/資料列的特徵是「橫向鋪滿整個表格寬度」（欄位排開幾乎佔滿頁寬），
     這點跟標題、報表資訊這種短句／靠左的 key-value 前言明顯不同——
     它們字數可能也不少，但橫向只佔一小段。
     做法：第一個「欄位數夠多，且橫向跨幅達頁寬 min_span_ratio 以上」的行，判定為表頭。
+    只適合表頭是單一行的報表；分組式多行表頭請用 find_data_run 那條路。
     """
     for i, l in enumerate(lines):
         cnt = len(l["words"])
@@ -81,6 +84,88 @@ def find_header_index_generic(lines, page_width, min_cols=3, min_span_ratio=0.5)
         if page_width > 0 and span / page_width >= min_span_ratio:
             return i
     return None
+
+
+def find_data_run(lines, min_cols=2, min_run=4):
+    """
+    通用模式，方案二（適合表頭跨多行、或方案一誤判標題列的情況）：
+    先找資料本體，而不是先找表頭——資料本體的特徵是「連續好幾行，
+    每行欄位數都固定一樣」，這比表頭本身的形狀更穩定可靠
+    （表頭可能跨行、可能有分組標籤，資料列通常是最規律的部分）。
+    回傳 (run_start, run_end_exclusive, n_cols)，找不到回傳 None。
+    """
+    n = len(lines)
+    i = 0
+    best = None
+    while i < n:
+        cnt = len(lines[i]["words"])
+        if cnt < min_cols:
+            i += 1
+            continue
+        j = i + 1
+        while j < n and len(lines[j]["words"]) == cnt:
+            j += 1
+        run_len = j - i
+        if run_len >= min_run and (best is None or run_len > best[1] - best[0]):
+            best = (i, j, cnt)
+        i = j
+    return best
+
+
+def find_header_block_start(lines, data_start, max_header_lines=3):
+    """
+    從資料本體的起點往回找表頭區塊的起點：只要相鄰行的間距還在資料本體
+    正常列高附近，就持續往回併入表頭；遇到間距明顯變大（代表前面是
+    報表資訊/標題，跟表格本身沒有緊密排版關係）就停止。
+    另外加一個行數上限（多層表頭實務上很少超過 2-3 行）當雙重保險，
+    避免報表資訊區塊本身間距也很緊湊時，誤把整段前言都併進表頭。
+    """
+    if data_start <= 0:
+        return data_start
+    if data_start + 1 < len(lines):
+        row_height = abs(lines[data_start + 1]["top"] - lines[data_start]["top"])
+    else:
+        row_height = abs(lines[data_start]["top"] - lines[data_start - 1]["top"])
+    row_height = row_height or 1
+    threshold = row_height * 1.3
+
+    idx = data_start
+    while idx > 0 and (data_start - idx) < max_header_lines:
+        gap = abs(lines[idx]["top"] - lines[idx - 1]["top"])
+        if gap >= threshold:
+            break
+        idx -= 1
+    return idx
+
+
+def _merge_header_block(header_lines, boundaries, n_cols):
+    """把表頭區塊（可能好幾行）依欄界分桶，同一欄的文字依上到下、左到右合併，
+    組成一個複合欄名（例如「非代繳開單」+「件數」合併成同一欄的欄名）"""
+
+    def col_index(x0):
+        idx = 0
+        for b in boundaries:
+            if x0 < b:
+                break
+            idx += 1
+        return min(idx, n_cols - 1)
+
+    cells = [[] for _ in range(n_cols)]
+    for l in header_lines:
+        for w in sorted(l["words"], key=lambda w: w["x0"]):
+            ci = col_index(w["x0"])
+            cells[ci].append(w["text"])
+
+    col_names, seen = [], {}
+    for parts in cells:
+        name = " ".join(parts).strip() or "欄位"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}_{seen[name]}"
+        else:
+            seen[name] = 0
+        col_names.append(name)
+    return col_names
 
 
 def words_from_ocr(page):
@@ -199,9 +284,9 @@ def extract_page_table(page, allow_ocr=False, header_idx=None, header_mode="auto
     回傳 (col_names, records, error_message, used_ocr, lines, resolved_header_idx)
 
     header_mode:
-      "auto"    - 先試序號模式，找不到再試通用模式（預設）
+      "auto"    - 序號模式 -> 資料本體模式(方案二) -> 單行表頭模式(方案一)，依序嘗試（預設）
       "serial"  - 只用序號模式
-      "generic" - 只用通用模式
+      "generic" - 只用通用模式（方案二再方案一）
     header_idx: 手動指定表頭在 lines 中的索引（0-based），指定時跳過自動偵測
     """
     words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
@@ -221,10 +306,26 @@ def extract_page_table(page, allow_ocr=False, header_idx=None, header_mode="auto
     lines = group_lines(words)
 
     resolved_idx = header_idx
+    col_names_override = None
+
     if resolved_idx is None:
         if header_mode in ("auto", "serial"):
             resolved_idx = find_header_index_serial(lines)
+
         if resolved_idx is None and header_mode in ("auto", "generic"):
+            # 方案二優先：資料本體（連續同欄位數的行）比表頭本身的形狀更可靠，
+            # 尤其適合表頭跨多行、有分組標籤的報表
+            run = find_data_run(lines)
+            if run:
+                data_start, data_end, n_cols_from_data = run
+                header_block_start = find_header_block_start(lines, data_start)
+                header_lines = lines[header_block_start:data_start]
+                boundaries_for_header = _compute_boundaries(lines, data_start - 1, n_cols_from_data)
+                col_names_override = _merge_header_block(header_lines, boundaries_for_header, n_cols_from_data)
+                resolved_idx = data_start - 1
+
+        if resolved_idx is None and header_mode in ("auto", "generic"):
+            # 方案一：適合表頭是單一行、資料列因文字長短不一而欄位數不固定的報表
             resolved_idx = find_header_index_generic(lines, page.width)
 
     if resolved_idx is None or resolved_idx >= len(lines):
@@ -240,8 +341,10 @@ def extract_page_table(page, allow_ocr=False, header_idx=None, header_mode="auto
             used_ocr, lines, resolved_idx,
         )
 
-    header_words = lines[resolved_idx]["words"]
-    col_names = _build_col_names(header_words)
+    if col_names_override is not None:
+        col_names = col_names_override
+    else:
+        col_names = _build_col_names(lines[resolved_idx]["words"])
     n_cols = len(col_names)
 
     boundaries = _compute_boundaries(lines, resolved_idx, n_cols)
